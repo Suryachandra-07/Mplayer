@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -49,6 +50,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -71,6 +73,8 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import dev.dreammusic.player.data.LocalMusicLibrary
+import dev.dreammusic.player.data.ArchiveMusicCatalog
+import dev.dreammusic.player.data.ArchiveTrack
 import dev.dreammusic.player.data.LocalPlaylist
 import dev.dreammusic.player.data.LocalPlaylistStore
 import dev.dreammusic.player.data.LocalTrack
@@ -146,7 +150,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class Tab(val title: String) { HOME("Home"), SEARCH("Search"), LIBRARY("Library") }
+private enum class Tab(val title: String) { HOME("Home"), SEARCH("Discover"), LIBRARY("Library") }
 
 @Composable
 private fun DreamMusicApp(controller: MediaController?, requestAudioPermission: ((Boolean) -> Unit) -> Unit) {
@@ -155,6 +159,11 @@ private fun DreamMusicApp(controller: MediaController?, requestAudioPermission: 
     var tracks by remember { mutableStateOf<List<LocalTrack>>(emptyList()) }
     var permissionReady by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    var onlineSearch by remember { mutableStateOf(true) }
+    var onlineTracks by remember { mutableStateOf<List<ArchiveTrack>>(emptyList()) }
+    var onlineLoading by remember { mutableStateOf(false) }
+    var onlineError by remember { mutableStateOf<String?>(null) }
+    var resolvingId by remember { mutableStateOf<String?>(null) }
     var currentTitle by remember { mutableStateOf("Nothing playing") }
     var currentArtist by remember { mutableStateOf("Choose a song from your library") }
     var isPlaying by remember { mutableStateOf(false) }
@@ -168,6 +177,8 @@ private fun DreamMusicApp(controller: MediaController?, requestAudioPermission: 
     val context = androidx.compose.ui.platform.LocalContext.current
     val scanScope = rememberCoroutineScope()
     val playlistStore = remember(context) { LocalPlaylistStore(context) }
+    val onlineCatalog = remember { ArchiveMusicCatalog() }
+    val uiScope = rememberCoroutineScope()
     var playlists by remember { mutableStateOf(playlistStore.all()) }
     val saveableStateHolder = rememberSaveableStateHolder()
 
@@ -182,6 +193,43 @@ private fun DreamMusicApp(controller: MediaController?, requestAudioPermission: 
             if (granted) scanScope.launch {
                 val result = withContext(Dispatchers.IO) { LocalMusicLibrary(context).loadTracks() }
                 tracks = result
+            }
+        }
+    }
+
+    LaunchedEffect(tab, onlineSearch, query) {
+        if (tab == Tab.SEARCH && onlineSearch && query.isNotBlank()) {
+            kotlinx.coroutines.delay(350)
+            onlineLoading = true
+            onlineError = null
+            try {
+                onlineTracks = withContext(Dispatchers.IO) { onlineCatalog.search(query) }
+            } catch (failure: Exception) {
+                onlineTracks = emptyList()
+                onlineError = failure.message ?: "Could not reach the music catalog. Check your connection and try again."
+            } finally {
+                onlineLoading = false
+            }
+        } else if (tab == Tab.SEARCH && onlineSearch && query.isBlank()) {
+            onlineTracks = emptyList()
+            onlineError = null
+        }
+    }
+
+    fun playOnline(track: ArchiveTrack) {
+        uiScope.launch {
+            resolvingId = track.identifier
+            onlineError = null
+            try {
+                val item = withContext(Dispatchers.IO) { onlineCatalog.resolve(track) }
+                controller?.setMediaItem(item)
+                controller?.prepare()
+                controller?.play()
+                showPlayer = true
+            } catch (failure: Exception) {
+                onlineError = failure.message ?: "That recording could not be played. Try another result."
+            } finally {
+                resolvingId = null
             }
         }
     }
@@ -246,9 +294,14 @@ private fun DreamMusicApp(controller: MediaController?, requestAudioPermission: 
                             onAddToPlaylist = ::openPlaylistPicker,
                             onOpenPlayer = { showPlayer = true },
                             onLibrary = { tab = Tab.LIBRARY },
+                            onDiscover = { tab = Tab.SEARCH; onlineSearch = true },
                         )
                         Tab.SEARCH -> SearchScreen(
-                            query = query, onQuery = { query = it }, tracks = tracks.filter {
+                            query = query, onQuery = { query = it }, onlineSearch = onlineSearch,
+                            onOnlineSearch = { onlineSearch = it }, onlineTracks = onlineTracks,
+                            onlineLoading = onlineLoading, onlineError = onlineError, resolvingId = resolvingId,
+                            onPlayOnline = ::playOnline,
+                            tracks = tracks.filter {
                                 query.isBlank() || it.title.contains(query, true) || it.artist.contains(query, true)
                             }, onLoad = ::scanTracks, onPlay = { track ->
                                 playTracks(controller, tracks, tracks.indexOf(track))
@@ -375,7 +428,7 @@ private fun playPlaylist(controller: MediaController?, playlist: LocalPlaylist, 
 private fun HomeScreen(
     tracks: List<LocalTrack>, title: String, playing: Boolean,
     onLoad: () -> Unit, onPlay: (LocalTrack) -> Unit, onAddToPlaylist: (LocalTrack) -> Unit,
-    onOpenPlayer: () -> Unit, onLibrary: () -> Unit,
+    onOpenPlayer: () -> Unit, onLibrary: () -> Unit, onDiscover: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxWidth(),
@@ -386,7 +439,7 @@ private fun HomeScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("DREAM MUSIC", color = Ember, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 3.sp)
-                    Text("Your sound,\nyour space.", color = SoftWhite, fontSize = 34.sp, lineHeight = 38.sp, fontWeight = FontWeight.SemiBold)
+                    Text("Find your\nnext sound.", color = SoftWhite, fontSize = 34.sp, lineHeight = 38.sp, fontWeight = FontWeight.SemiBold)
                 }
                 IconButton(onClick = onLibrary, modifier = Modifier.size(50.dp).background(SurfaceBlack, CircleShape)) {
                     Icon(Icons.Default.LibraryMusic, contentDescription = "Open library", tint = SoftWhite)
@@ -396,14 +449,14 @@ private fun HomeScreen(
         item {
             Box(Modifier.fillMaxWidth().height(190.dp).clip(RoundedCornerShape(28.dp))
                 .background(Brush.linearGradient(listOf(Color(0xFF603A2F), Color(0xFF211513), Color(0xFF111010))))
-                .clickable(onClick = onLoad).padding(22.dp)) {
+                .clickable(onClick = onDiscover).padding(22.dp)) {
                 Column(Modifier.align(Alignment.BottomStart)) {
-                    Text("MADE FOR YOUR MOMENTS", color = Color(0xFFEAB49D), fontSize = 10.sp, letterSpacing = 2.sp)
+                    Text("DISCOVER MUSIC ONLINE", color = Color(0xFFEAB49D), fontSize = 10.sp, letterSpacing = 2.sp)
                     Spacer(Modifier.height(8.dp))
-                    Text("Start with\nyour own music", color = SoftWhite, fontSize = 26.sp, lineHeight = 29.sp, fontWeight = FontWeight.Medium)
+                    Text("Explore independent\nmusic and recordings", color = SoftWhite, fontSize = 24.sp, lineHeight = 28.sp, fontWeight = FontWeight.Medium)
                 }
                 Box(Modifier.align(Alignment.TopEnd).size(48.dp).background(Color.White.copy(alpha = .12f), CircleShape), Alignment.Center) {
-                    Icon(Icons.Default.MusicNote, null, tint = SoftWhite, modifier = Modifier.size(24.dp))
+                    Icon(Icons.Default.Cloud, null, tint = SoftWhite, modifier = Modifier.size(24.dp))
                 }
             }
         }
@@ -427,23 +480,71 @@ private fun HomeScreen(
 
 @Composable
 private fun SearchScreen(
-    query: String, onQuery: (String) -> Unit, tracks: List<LocalTrack>, onLoad: () -> Unit,
+    query: String, onQuery: (String) -> Unit, onlineSearch: Boolean, onOnlineSearch: (Boolean) -> Unit,
+    onlineTracks: List<ArchiveTrack>, onlineLoading: Boolean, onlineError: String?, resolvingId: String?,
+    onPlayOnline: (ArchiveTrack) -> Unit, tracks: List<LocalTrack>, onLoad: () -> Unit,
     onPlay: (LocalTrack) -> Unit, onAddToPlaylist: (LocalTrack) -> Unit,
 ) {
     Column(Modifier.fillMaxSize().padding(horizontal = 22.dp).padding(top = 32.dp)) {
-        Text("Search your\nlibrary.", color = SoftWhite, fontSize = 32.sp, lineHeight = 36.sp, fontWeight = FontWeight.SemiBold)
+        Text(if (onlineSearch) "Discover\nmusic online." else "Search your\nlibrary.", color = SoftWhite, fontSize = 32.sp, lineHeight = 36.sp, fontWeight = FontWeight.SemiBold)
         Spacer(Modifier.height(22.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            SearchModeChip("Online", onlineSearch) { onOnlineSearch(true) }
+            SearchModeChip("On device", !onlineSearch) { onOnlineSearch(false) }
+        }
+        Spacer(Modifier.height(12.dp))
         androidx.compose.material3.OutlinedTextField(
             value = query, onValueChange = onQuery, modifier = Modifier.fillMaxWidth(),
-            placeholder = { Text("Search songs or artists", color = Muted) },
+            placeholder = { Text(if (onlineSearch) "Search artists, songs, recordings" else "Search songs or artists", color = Muted) },
             leadingIcon = { Icon(Icons.Default.Search, null, tint = Ember) },
             singleLine = true, shape = RoundedCornerShape(18.dp),
         )
         Spacer(Modifier.height(14.dp))
-        if (tracks.isEmpty()) EmptyState("Search your music", "Local songs appear here after you scan your library.", "Scan music", onLoad)
+        if (onlineSearch) {
+            Text("Online audio from the Internet Archive · rights vary by item", color = Muted, fontSize = 11.sp)
+            Spacer(Modifier.height(8.dp))
+            when {
+                onlineLoading -> Text("Searching the catalog…", color = Muted, modifier = Modifier.padding(vertical = 20.dp))
+                onlineError != null -> Text(onlineError, color = Color(0xFFE6A28D), modifier = Modifier.padding(vertical = 20.dp))
+                query.isBlank() -> Column(Modifier.fillMaxWidth().padding(vertical = 20.dp)) {
+                    Text("Search a song or artist", color = SoftWhite, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(6.dp))
+                    Text("Find independent releases, live recordings, and other audio shared in the archive.", color = Muted, fontSize = 13.sp, lineHeight = 19.sp)
+                }
+                onlineTracks.isEmpty() -> Text("No recordings found. Try another search.", color = Muted, modifier = Modifier.padding(vertical = 20.dp))
+                else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    items(onlineTracks, key = { it.identifier }) { track ->
+                        ArchiveTrackRow(track, isLoading = resolvingId == track.identifier, onClick = { onPlayOnline(track) })
+                    }
+                }
+            }
+        } else if (tracks.isEmpty()) EmptyState("Search your music", "Local songs appear here after you scan your library.", "Scan music", onLoad)
         else LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
             items(tracks) { track -> PlaylistTrackRow(track, onClick = { onPlay(track) }, onAddToPlaylist = { onAddToPlaylist(track) }) }
         }
+    }
+}
+
+@Composable
+private fun SearchModeChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    Text(label, color = if (selected) Ink else SoftWhite, fontSize = 12.sp,
+        modifier = Modifier.clip(RoundedCornerShape(20.dp)).background(if (selected) Ember else SurfaceBlack)
+            .clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 9.dp))
+}
+
+@Composable
+private fun ArchiveTrackRow(track: ArchiveTrack, isLoading: Boolean, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).clickable(onClick = onClick).padding(vertical = 9.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(46.dp).clip(RoundedCornerShape(13.dp)).background(Color(0xFF29201D)), Alignment.Center) {
+            Icon(if (isLoading) Icons.Default.Cloud else Icons.Default.MusicNote, null, tint = Ember, modifier = Modifier.size(22.dp))
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(track.title, color = SoftWhite, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+            Text(track.artist, color = Muted, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 12.sp)
+        }
+        Text(if (isLoading) "…" else "PLAY", color = Ember, fontSize = 10.sp, letterSpacing = 1.sp, modifier = Modifier.padding(horizontal = 8.dp))
     }
 }
 
